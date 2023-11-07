@@ -1,0 +1,634 @@
+---
+title: "Employee data for classification task"
+author: "Nhat Quang VU"
+format: html
+editor: visual
+toc: true
+echo: TRUE
+theme:
+  - Minty
+---
+
+# Introduction and summary
+
+In today's corporate environment, understanding the attributes and experiences of employees is paramount. This project analyzes a dataset in \[kaggle\](Employee dataset (kaggle.com) containing information about the company's workforce, including their educational backgrounds, demographics, and employment factors. It aims to uncover valuable insights that can inform strategies to optimize workforce management and foster a productive, inclusive, and satisfied work environment.
+
+By delving into the dataset, this project will provide an overview of the educational qualifications, examine the variation in employees' length of service across cities, explore the correlation between payment tier and domain experience, assess the gender distribution within the workforce, and investigate patterns in leave-taking behavior. These insights can empower the company to make data-driven decisions that enhance its operations and employee well-being.
+
+* Objective: To analyze a dataset with employee information to gain insights into workforce management.
+
+* Analytical Goals:
+    + Overview of educational qualifications of employees.
+    + Analysis of service length variation across cities.
+    + Exploration of payment tiers in relation to domain experience.
+    + Assessment of gender distribution in the workforce.
+    + Investigation of leave-taking patterns.
+* Methodology:
+    + Extensive data exploration and cleaning.
+    + Parallel processing to expedite computations.
+    + Employed a variety of machine learning models (Random forest, XGboost,Support Vector Machine and Stacking) for classification task.
+* Conclusion:
+    + A comprehensive analysis revealed significant correlations between educational background and job performance, underscoring the importance of aligning educational initiatives with career development programs.
+    + Developed a predictive model with accuracy 84.8% 
+    
+Here are full script and results
+
+```{r, setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+```
+
+```{r library}
+library(tidyverse)
+library(doParallel)
+library(glue)
+library(vroom)
+library(janitor)
+library(tidymodels)
+library(themis)
+library(vip)
+library(ggcorrplot)
+library(fastshap)
+library(shapviz)
+library(kernelshap)
+library(shapper)
+library(SHAPforxgboost)
+library(stacks)
+library(highcharter)
+library(patchwork)
+library(ggpmisc)
+library(parallel)
+library(gridExtra)
+library(plotly)
+```
+
+```{r}
+# speed up computation with parallel processing
+all_cores <- detectCores(logical = FALSE)
+registerDoParallel(cores = all_cores)
+```
+
+# Explore the data
+
+```{r import data}
+employee <- read_csv("https://raw.githubusercontent.com/vn-quant/project_employee/R/Employee.csv") %>% clean_names()
+
+# a quick look through the data to see if any feature are in the wrong format  
+employee %>% glimpse()
+
+employee %>% skimr::skim()
+
+employee %>% 
+  mutate(leave_or_not = factor(leave_or_not,
+                               label = c("stay","leave")),
+         joining_year = factor(joining_year),
+         payment_tier = factor(payment_tier)) -> employee_df
+```
+
+As we can see, there is no missing value, but some columns are in the wrong format. For example, the target value `leave_or_not` should be `factor` instead of `integer` .
+
+My goal is to predict the employment decision base on their backgrounds, demographics, and other factors.
+
+```{r leave or not}
+ggplot(employee_df) +
+  aes(x = leave_or_not) +
+  geom_bar(fill = "#354E79",
+           #fill = "#191339"
+           ) +
+  stat_count(geom = "text", 
+             colour = "white", 
+             size = 5,
+             aes(label = after_stat(count)),
+             position = position_stack(vjust=0.5)) +
+  theme_minimal()
+```
+
+we can observed that an imbalance in the dataset
+
+```{r Relationship between predictors and target variable}
+# Define the list of x-variables to loop through
+vars <- c("education" ,"city","ever_benched"  ,"joining_year","payment_tier" ,"gender","experience_in_current_domain")
+
+# Create an empty list to store the plots
+plots <- list()
+
+# Loop through the x-variables and create plots
+for (x in vars) {
+  # Create the ggplot object with the current x-variable
+  plot <- ggplot(employee_df) +
+    aes(x = x, fill = leave_or_not) +
+    geom_bar(position = "dodge") +
+    labs(y = "",
+         x="",
+         subtitle = gsub("_"," ", paste0(x)))+
+    scale_fill_manual( values = c(`stay` = "#FBC89C",`leave` = "#F47378")) +
+    stat_count(geom = "text", 
+             colour = "#191339", 
+             size = 4,
+             aes(label = after_stat(count)),
+             position=position_dodge(width=0.9), vjust= -0.2)+
+    theme_minimal()+
+    theme(legend.position = "none")
+  
+  # Append the plot to the plot_list
+  plots[[x]] <- plot
+}
+
+plots[[8]] <-  
+ggplot(employee_df) +
+  aes(x = age, fill = leave_or_not) +
+  geom_density(adjust = 1.5) +
+  theme_minimal()+
+  labs(y = "",
+       x = "",
+       subtitle = "age")+
+  scale_fill_manual( values = c(`stay` = "#FBC89C",`leave` = "#F47378")) +
+  theme(legend.position = "none")
+```
+
+```{r fig.width=9, fig.height=16}
+plots[[1]] + plots[[2]] + 
+  plots[[3]] + plots[[4]] + 
+  plots[[5]] + plots[[6]] + 
+  plots[[7]] + plots[[8]] + 
+  plot_layout(ncol = 2) +
+  plot_annotation(
+    title = "Relationship between predictors and target variable",
+    subtitle = glue('<span style = "color:#FBC89C">**stay**</span>',
+                    ' or ',
+                    '<span style = "color:#F47378">**leave**</span>'),
+                  theme=theme(plot.subtitle=ggtext::element_markdown(size = 15)))
+```
+
+These features look like they exhibit some big differences in the decision to leave or stay
+
+# Modeling
+
+My approach involves exploring three distinct models: Random Forest (RF), XGBoost (XGB), Support Vector Machine (SVM) and Stacking method using the three models to construct a predictive model. The primary objective is to identify the influential features that impact the decision-making process of these models.
+
+The stepwise process begins with data preparation, where i split the data into training and testing sets, and create cross-validation resamples. Following this, i proceed to model training and evaluation, individually exploring the RF, XGB, SVM, and Stacking models. Each model's performance will be assessed using ROC AUC and accuracy.
+
+Due to the dataset's class imbalancendefinedndefined, the primary performance metric used for evaluation is the Receiver Operating Characteristic Area Under the Curve (ROC AUC), which offers a robust assessment of model performance. Additionally, accuracy is considered for its ease of interpretation, although it is secondary to ROC AUC in addressing class imbalance.
+
+By following the process above , i aim to develop a predictive model that not only performs well but also provides some insights into the key features that drive the decision of the employee and suggest some solution and conclude conclusions
+
+## Data preparation
+
+```{r split data}
+set.seed(031023)
+employee_split <- initial_split(employee_df, strata = leave_or_not, prop = 0.85)
+employee_train <- training(employee_split)
+employee_test <- testing(employee_split)
+
+folds <- vfold_cv(employee_train, strata =leave_or_not, v =5)
+```
+
+```{r recipe}
+employee_rec <- recipe(leave_or_not ~.,
+                       data = employee_train) %>% 
+  step_dummy(all_nominal(), -all_outcomes()) %>%
+  step_normalize(age) %>% 
+  step_smote(leave_or_not)
+```
+
+After spliting the initial dataset into train set and test set and create `folds` for the cross-validation, the primary data preprocessing steps include handling nominal variables, normalizing age, and applying SMOTE method to address class imbalance in the target variable.
+
+## Random Forest
+
+```{r rf tune spec & wf}
+#random forest model specification 
+rf_tune_spec <- rand_forest(
+  mtry = tune(), 
+  trees = 500,
+  min_n = tune() 
+) %>%
+  set_mode("classification") %>%
+  set_engine("ranger")
+
+#random forest workflow
+rf_tune_wf <- workflow() %>%
+  add_recipe(employee_rec) %>%
+  add_model(rf_tune_spec)
+```
+
+For the random forest model, i tune 2 parametres:
+
+-   `mtry` : The number of variables randomly sampled as candidates at each split. A smaller value makes the model less prone to overfitting, while a larger value can improve accuracy.
+
+-   `min_n` : Control the depth and complexity of the individual trees
+
+### Tuning hyperparameters
+
+```{r rf Train hyperparameters}
+
+set.seed(01031023)
+
+rf_tune_result <- tune_grid(
+  rf_tune_wf,
+  resamples = folds,
+  grid = 20,
+  control = control_stack_grid()
+)
+
+rf_tune_result %>% 
+    collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  select(mean, min_n, mtry) %>%
+  pivot_longer(min_n:mtry,
+    values_to = "value",
+    names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "AUC")+
+  theme_bw()
+```
+
+This grid did not try every combination of min_n and mtry but we can see that lower value of `mtry` , from 2 to 5 is fairly good while in case of `min_n` , we should focus more when `min_n` above 10. I set ranges of the parametre again, but this time more focus in `min_n` .
+
+```{r}
+rf_grid <- grid_regular(
+  mtry(range = c(2, 5)),
+  min_n(range = c(15, 50)),
+  levels = 5
+)
+
+rf_regular_res <- tune_grid(
+  rf_tune_wf,
+  resamples = folds,
+  grid = rf_grid
+)
+
+rf_regular_res %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  mutate(min_n = factor(min_n)) %>%
+  ggplot(aes(mtry, mean, color = min_n)) +
+  geom_line(alpha = 0.5, linewidth = 1.5) +
+  geom_point() +
+  labs(y = "AUC") +
+  theme_bw()
+```
+
+### Choosing the best model and results
+
+```{r best rf}
+final_rf <- finalize_model(
+  rf_tune_spec,
+  select_best(rf_regular_res,  "roc_auc")
+)
+
+final_rf %>%
+  set_engine("ranger", importance = "permutation") %>%
+  fit(leave_or_not ~ .,
+    data = juice(prep(employee_rec))
+  ) %>%
+  vip(geom = "col")+
+  theme_minimal() 
+```
+
+The vip plot suggest the joining year 2018 is most categorical. As can be predicted from the graph of the relationship between variables, the accession year 2018 shows quite clear classification possibilities. This could be due to a political/cultural event that caused employees who joined the company during this time to decide to quit, which is unlikely to be a trend given the rates of people joining the company. The company's decision to quit in 2017 was quite low compared to the retention rate. The following are education (master) and gender (male), which are both reasonable and understandable.
+
+```{r}
+final_rf_res <- workflow() %>%
+  add_recipe(employee_rec) %>%
+  add_model(final_rf) %>% 
+  last_fit(employee_split)
+
+final_rf_res %>% 
+  collect_predictions() %>% 
+  conf_mat(truth = leave_or_not,
+           estimate  = .pred_class)
+
+final_rf_res %>% 
+  collect_predictions() %>% 
+  roc_curve(leave_or_not, .pred_stay) %>% 
+  autoplot()
+```
+
+## XGboost
+
+The same process to others models
+
+```{r xgb tune & wf}
+xgb_tune_spec <- boost_tree(
+  trees = 500,
+  tree_depth = tune(),                         ## controls the maximum depth of decision trees
+  min_n = tune(),                              ## minimum sum of instance weight
+  loss_reduction = tune(),                     ##  the minimum loss reduction required to make a further partition on a leaf node
+  sample_size = tune(),                        ## controls the fraction of training data that is randomly sampled for each boosting round
+  mtry = tune(),                               ## the fraction of features (columns) used to build each tree
+  learn_rate = tune()                          ## step size at each iteration while moving towards a minimum of a loss function
+) %>%
+  set_engine("xgboost", 
+             objective = "binary:logistic") %>%
+  set_mode("classification")
+
+xgb_tune_wf <- workflow() %>%
+  add_recipe(employee_rec) %>%
+  add_model(xgb_tune_spec)
+```
+
+### Tuning hyperparameters
+
+```{r xgb Train hyperparameters}
+doParallel::registerDoParallel()
+
+set.seed(02031023)
+
+xgb_tune_result <- tune_grid(
+  xgb_tune_wf,
+  resamples = folds,
+  grid = 20,
+  control = control_stack_grid()
+)
+
+xgb_tune_result %>% 
+  collect_metrics() %>% 
+  filter(.metric == "roc_auc") %>%
+  select(mean, mtry:sample_size) %>%
+  pivot_longer(mtry:sample_size,
+               values_to = "value",
+               names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(alpha = 0.8, show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "roc_auc") +
+  theme_minimal()
+```
+
+Since the tuning time took forever to complete so i tried several combinations that performed well.
+
+### Choosing the best model and SHAP
+
+```{r best xgb}
+final_xgb <- finalize_model(
+  xgb_tune_spec,
+  select_best(xgb_tune_result,"roc_auc")
+)
+
+final_xgb
+```
+
+```{r}
+final_xgb_res <- workflow() %>%
+  add_recipe(employee_rec) %>%
+  add_model(final_xgb) %>% 
+  last_fit(employee_split)
+
+final_xgb_res %>% 
+  collect_predictions() %>% 
+  conf_mat(truth = leave_or_not,
+           estimate  = .pred_class ) 
+
+final_xgb_res %>% 
+  collect_predictions() %>% 
+  roc_curve(leave_or_not, .pred_stay) %>% 
+  autoplot()
+  
+```
+
+```{r}
+X <- prep(employee_rec, employee_train) %>% 
+  juice() %>% 
+  select(-leave_or_not) %>% 
+  as.matrix()
+
+xg_mod <- workflow() %>%
+  add_recipe(employee_rec) %>%
+  add_model(final_xgb) %>% 
+  fit(employee_train) %>% 
+  extract_fit_parsnip()
+
+# Compute shapley values 
+shap <- explain(xg_mod$fit, X = X, exact = TRUE)
+```
+
+```{r}
+xgb_tune_wf %>%
+  finalize_workflow(select_best(xgb_tune_result, "roc_auc")) %>%
+  last_fit(employee_split) %>% 
+  extract_fit_parsnip() -> xgb_fit
+
+shap.prep <- shap.prep(
+    xgb_model = extract_fit_engine(xgb_fit),
+    X_train = bake(prep(employee_rec),
+      has_role("predictor"),
+      new_data = NULL,
+      composition = "matrix"
+    )
+  )
+
+shap.plot.summary(shap.prep)
+```
+
+-   The y-axis indicates the variable name, in order of importance from top to bottom. The value next to them is the mean SHAP value. (the higher, the more important)
+
+-   On the x-axis is the SHAP value. Indicates how much is the change in log-odds. From this number we can extract the probability of the output.
+
+-   Gradient color indicates the original value for that variable.
+
+-   Each point represents a row from the original dataset.
+
+In general, SHAP results are similar to VIP plot, but more detailed.
+
+## SVM
+
+```{r svm tune & wf}
+svm_linear_tune_spec <- svm_linear(cost = tune(), 
+                                margin = tune()) %>%
+  set_mode("classification") %>%
+  set_engine("kernlab")
+
+svm_linear_tune_wf <- workflow() %>%
+  add_recipe(employee_rec %>% step_normalize(age) ) %>%
+  add_model(svm_linear_tune_spec)
+
+svm_linear_result <- tune_grid(
+  svm_linear_tune_wf,
+  resamples = folds,
+  grid = 10,
+  control = control_stack_grid()
+)
+```
+
+```{r}
+svm_linear_result %>% 
+    collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  select(mean,  cost, margin) %>%
+  pivot_longer(cost:margin,
+    values_to = "value",
+    names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "AUC")+
+  theme_bw()
+```
+
+```{r best svm}
+final_svm <- finalize_model(
+  svm_linear_tune_spec,
+  select_best(svm_linear_result,"roc_auc")
+)
+
+final_svm
+```
+
+```{r}
+final_svm_res <- workflow() %>%
+  add_recipe(employee_rec) %>%
+  add_model(final_xgb) %>% 
+  last_fit(employee_split) 
+
+final_svm_res %>% 
+  collect_predictions() %>% 
+  conf_mat(truth = leave_or_not,
+           estimate  = .pred_class ) 
+
+final_svm_res %>% 
+  collect_predictions() %>% 
+  roc_curve(leave_or_not, .pred_stay) %>% 
+  ggplot(aes(x = 1 - specificity, y = sensitivity)) +
+  geom_line(linewidth = 1.1, color = "midnightblue") +
+  geom_abline(
+    lty = 2, alpha = 0.5,
+    color = "gray50",
+    linewidth = 1
+  )+
+  theme_bw()
+  
+```
+
+## Stacking
+
+Stacking, short for "stacked generalization", is an ensemble learning technique that combines multiple classification or regression models via a meta-classifier or a meta-regressor. The base-level models are trained based on a complete training set, then the meta-model is trained on the outputs of the base models as features. Stacking often achieves higher performance than any single model and even other ensemble methods like bagging and boosting.
+
+```{r}
+set.seed(1234)
+stacking_md <- stacks() %>%
+  add_candidates(rf_tune_result) %>% 
+  add_candidates(xgb_tune_result) %>% 
+  add_candidates(svm_linear_result) %>% 
+  blend_predictions()
+
+autoplot(stacking_md, type = "members") +
+  theme_bw()
+
+autoplot(stacking_md, type = "weight") +
+  theme_bw()
+
+stacking_md %>% fit_members()
+```
+
+```{r}
+stacking_result <- employee_test %>% 
+  bind_cols(predict(stacking_md %>% fit_members(), ., "prob")) %>% 
+  bind_cols(predict(stacking_md %>% fit_members(), .)) 
+```
+
+```{r}
+stacking_result %>% 
+  conf_mat(truth = leave_or_not,
+           estimate  = .pred_class ) 
+
+stacking_result %>% 
+  roc_curve(leave_or_not, .pred_stay) %>% 
+  ggplot(aes(x = 1 - specificity, y = sensitivity)) +
+  geom_line(linewidth = 1.1, color = "midnightblue") +
+  geom_abline(
+    lty = 2, alpha = 0.5,
+    color = "gray50",
+    linewidth = 1
+  )+
+  theme_minimal()
+```
+
+# Conclusion
+
+```{r roc auc}
+final_result <- bind_rows(
+  final_rf_res %>% collect_predictions() %>% mutate(model = "RF"),
+  final_xgb_res %>% collect_predictions() %>% mutate(model = "XGB"),
+  final_svm_res %>% collect_predictions() %>% mutate(model = "SVM"),
+  stacking_result %>% mutate(model = "Stacking")
+) %>% 
+  select(.pred_stay,.pred_leave,.pred_class,leave_or_not,model)
+```
+
+```{r}
+final_result %>% 
+  group_by(model) %>% 
+  roc_curve(leave_or_not, .pred_stay) %>% 
+  autoplot() %>% 
+  ggplotly() %>% 
+  layout(title = list(
+    text = "Interactive ROC curve",
+    font = list(size = 14)  # Adjust the font size as needed
+  ))
+```
+
+Base on the ROC AUC plot, the perfomance of the four model is quite similar. Let took a closer look to their confusion matrix and some metrics.
+
+```{r}
+# set up metrics
+metrics <- c("accuracy","roc_auc","sens","spec","recall","precision")
+
+conf_mat_plot <- name <- function(data,model = "") {
+  
+data %>% 
+  conf_mat(truth = leave_or_not,
+           estimate  = .pred_class ) %>% 
+  autoplot(type = "heatmap") +
+  labs(
+    title = paste0("Confusion matrix ",model)
+  ) -> cm_plot
+  
+
+data %>% 
+  conf_mat(truth = leave_or_not,
+           estimate  = .pred_class ) %>% 
+  summary() %>% 
+  rbind(roc_auc(data,
+        leave_or_not,
+        .pred_stay)) %>% 
+  filter(.metric %in% metrics) %>%
+  mutate(.estimate = round(.estimate,3)) %>% 
+  mutate(.metric = paste0(.metric,": ",.estimate)) %>% 
+  select(.metric) %>% 
+  t() %>% 
+  tableGrob(rows = NULL) -> tbl
+
+return(grid.arrange(cm_plot, bottom = tbl))
+
+}
+
+```
+
+```{r conf mat plot}
+conf_mat_plot(final_rf_res %>% collect_predictions(),"Random forest")
+conf_mat_plot(final_xgb_res %>% collect_predictions(),"XGB")
+conf_mat_plot(final_svm_res %>% collect_predictions(),"SVM linear")
+conf_mat_plot(stacking_result,"Stacking")
+```
+
+## Analysis
+
+-   **Random Forest (RF)** exhibits a balanced performance with an accuracy of 0.832 and a ROC AUC of 0.855, indicating its ability to maintain a commendable trade-off between sensitivity (0.917) and specificity (0.671).
+
+-   **XGBoost (XGB)** offers a performance closely aligned with RF, with a slightly lower sensitivity of 0.902 but marginally better specificity at 0.683. Its ROC AUC of 0.847 showcases its robust discriminative power.
+
+-   **Support Vector Machine (SVM)** mirrors a performance akin to XGB with an accuracy of 0.83. Its specificity stands at 0.688, a tad higher than RF, while maintaining a sensitivity of 0.904.
+
+-   **Stacking** leads in accuracy with 0.85 and exhibits an outstanding sensitivity of 0.969. However, this seems to come at the cost of specificity, which at 0.621, is the lowest among the models. Its ROC AUC of 0.852 suggests a strong overall performance but hints at its inclination towards predicting positive instances.
+
+## Selection
+
+For applications prioritizing the detection of positive instances, the **Stacking model** emerges as the top choice due to its unparalleled sensitivity. However, its lower specificity indicates a potential for higher false positives, which is more flavor in some situation.
+
+For scenarios demanding a balanced outcome between true positives and true negatives, the **Random Forest model** stands out as the most versatile choice
+
+**XGB and SVM** serve as robust alternatives to RF, with performances that are closely matched, but their complexity make the tranning time inefficient.
